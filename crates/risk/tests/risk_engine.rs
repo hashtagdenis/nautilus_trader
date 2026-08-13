@@ -41,7 +41,7 @@ use nautilus_common::{
     },
     throttler::RateLimit,
 };
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_execution::engine::{ExecutionEngine, config::ExecutionEngineConfig};
 use nautilus_model::{
     accounts::{AccountAny, BettingAccount, CashAccount, MarginAccount, stubs::cash_account},
@@ -84,6 +84,7 @@ use nautilus_portfolio::Portfolio;
 use rstest::{fixture, rstest};
 use rust_decimal::{Decimal, prelude::FromPrimitive};
 use rust_decimal_macros::dec;
+use serde_json::Value;
 use ustr::Ustr;
 
 // Helper that registers message collectors for ExecEngine.process events and
@@ -3065,6 +3066,113 @@ fn test_submit_order_below_min_notional_respects_reduce_only(
         assert_eq!(forwarded.client_order_id, order.client_order_id());
         assert_eq!(forwarded.position_id, command_position_id);
         assert!(forwarded.order_init.reduce_only);
+    }
+}
+
+#[rstest]
+#[case::no_params(None, true)]
+#[case::close_position_false(Some(false), true)]
+#[case::close_position_true(Some(true), false)]
+fn test_submit_order_below_min_notional_respects_close_position(
+    #[case] close_position: Option<bool>,
+    #[case] expect_denied: bool,
+    strategy_id_ema_cross: StrategyId,
+    client_id_binance: ClientId,
+    trader_id: TraderId,
+    instrument_eth_usdt: InstrumentAny,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    execute_order_event_handler: TypedIntoMessageSavingHandler<TradingCommand>,
+    mut simple_cache: Cache,
+) {
+    simple_cache
+        .add_instrument(instrument_eth_usdt.clone())
+        .unwrap();
+
+    let mut margin_account = margin_account_with_usdt_balance("100 USDT", "0 USDT", "100 USDT");
+    margin_account.set_default_leverage(dec!(10));
+    simple_cache
+        .add_account(AccountAny::Margin(margin_account))
+        .unwrap();
+
+    let mut risk_engine =
+        get_risk_engine(Some(Rc::new(RefCell::new(simple_cache))), None, None, false);
+
+    // A whole-position exit: `close_position` carries close intent on its own and
+    // cannot be combined with `reduce_only`, which venues reject in combination.
+    // The risk engine values such an order at its trigger price, which for an exit
+    // set below the market puts the notional under the venue minimum.
+    let trigger_price = Price::from("5000.00");
+    let order = OrderTestBuilder::new(OrderType::MarketIfTouched)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("0.001"))
+        .trigger_price(trigger_price)
+        .build();
+    let notional = instrument_eth_usdt
+        .try_calculate_notional_value(order.quantity(), trigger_price, Some(true))
+        .unwrap();
+
+    assert!(!order.is_reduce_only());
+    assert_eq!(
+        instrument_eth_usdt.min_notional(),
+        Some(Money::from("10.00 USDT"))
+    );
+    assert_eq!(notional, Money::from("5.00 USDT"));
+
+    risk_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(client_id_binance), false)
+        .unwrap();
+
+    let params = close_position.map(|value| {
+        let mut params = Params::new();
+        params.insert("close_position".to_string(), Value::Bool(value));
+        params
+    });
+    let submit_order = SubmitOrder::new(
+        trader_id,
+        Some(client_id_binance),
+        strategy_id_ema_cross,
+        instrument_eth_usdt.id(),
+        order.client_order_id(),
+        order.init_event().clone(),
+        None,
+        None,
+        params,
+        UUID4::new(),
+        risk_engine.clock().borrow().timestamp_ns(),
+        None,
+    );
+
+    risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+
+    let saved_process_messages =
+        get_process_order_event_handler_messages(&process_order_event_handler);
+    let saved_execute_messages =
+        get_execute_order_event_handler_messages(&execute_order_event_handler);
+
+    if expect_denied {
+        assert_eq!(saved_process_messages.len(), 1);
+        assert_eq!(
+            saved_process_messages[0].client_order_id(),
+            order.client_order_id()
+        );
+        assert_eq!(
+            saved_process_messages[0].message().unwrap(),
+            Ustr::from(
+                "NOTIONAL_BELOW_MINIMUM: min_notional=Money(10.00000000, USDT), notional=Money(5.00000000, USDT)"
+            )
+        );
+        assert!(saved_execute_messages.is_empty());
+    } else {
+        assert!(saved_process_messages.is_empty());
+        assert_eq!(saved_execute_messages.len(), 1);
+        let TradingCommand::SubmitOrder(forwarded) = &saved_execute_messages[0] else {
+            panic!("Expected SubmitOrder command");
+        };
+        assert_eq!(forwarded.client_order_id, order.client_order_id());
+        assert!(!forwarded.order_init.reduce_only);
     }
 }
 

@@ -35,7 +35,7 @@ use nautilus_common::{
     runner::{TradingCommandMessage, try_get_trading_cmd_sender},
     throttler::{RateLimit, Throttler},
 };
-use nautilus_core::{UUID4, WeakCell};
+use nautilus_core::{Params, UUID4, WeakCell};
 use nautilus_execution::trailing::{
     trailing_stop_calculate_with_bid_ask, trailing_stop_calculate_with_last,
 };
@@ -70,6 +70,19 @@ fn format_rate_limit(rate_limit: &RateLimit) -> String {
         let micros = remainder_ns / 1_000;
         format!("{limit}/{hours:02}:{minutes:02}:{seconds:02}.{micros:06}")
     }
+}
+
+/// Returns whether a submit command's order parameters carry `close_position`.
+///
+/// Read exactly as the venue adapters read it, so that the risk engine and the
+/// adapter agree on which orders carry close intent. An order submitted with this
+/// parameter closes an entire position and carries no quantity on the wire, so it
+/// is position-reducing in the same sense as a `reduce_only` order, but it cannot
+/// also be `reduce_only`, which venues reject in combination.
+fn closes_position(params: Option<&Params>) -> bool {
+    params
+        .and_then(|params| params.get_bool("close_position"))
+        .unwrap_or(false)
 }
 
 type SubmitCommandFn = Box<dyn Fn(TradingCommand)>;
@@ -630,7 +643,11 @@ impl RiskEngine {
             return; // Denied
         }
 
-        if !self.check_orders_risk(&instrument, &[order]) {
+        if !self.check_orders_risk(
+            &instrument,
+            &[order],
+            closes_position(command.params.as_ref()),
+        ) {
             return; // Denied
         }
 
@@ -711,7 +728,11 @@ impl RiskEngine {
             return; // Denied
         };
 
-        if !self.check_orders_risk(&representative, &orders) {
+        if !self.check_orders_risk(
+            &representative,
+            &orders,
+            closes_position(command.params.as_ref()),
+        ) {
             self.deny_order_list(
                 &orders,
                 &OrderDeniedReason::OrderListDenied {
@@ -973,7 +994,12 @@ impl RiskEngine {
         true
     }
 
-    fn check_orders_risk(&self, instrument: &InstrumentAny, orders: &[OrderAny]) -> bool {
+    fn check_orders_risk(
+        &self,
+        instrument: &InstrumentAny,
+        orders: &[OrderAny],
+        closes_position: bool,
+    ) -> bool {
         let mut orders_by_account: AHashMap<Option<AccountId>, Vec<&OrderAny>> = AHashMap::new();
         for order in orders {
             orders_by_account
@@ -983,7 +1009,12 @@ impl RiskEngine {
         }
 
         for (account_id, account_orders) in &orders_by_account {
-            if !self.check_orders_risk_for_account(instrument, account_orders, *account_id) {
+            if !self.check_orders_risk_for_account(
+                instrument,
+                account_orders,
+                *account_id,
+                closes_position,
+            ) {
                 return false;
             }
         }
@@ -1000,6 +1031,7 @@ impl RiskEngine {
         instrument: &InstrumentAny,
         orders: &[&OrderAny],
         account_id: Option<AccountId>,
+        closes_position: bool,
     ) -> bool {
         let mut max_notional: Option<Money> = None;
 
@@ -1433,8 +1465,12 @@ impl RiskEngine {
                 return false; // Denied
             }
 
-            // Reduce-only orders may close residual positions below venue minimum
-            if !order.is_reduce_only()
+            // Reduce-only orders may close residual positions below venue minimum,
+            // and so may orders carrying the `close_position` order parameter: they
+            // retire an entire position, which venues accept below the minimum for
+            // the same reason. They cannot also be `reduce_only` (venues reject the
+            // combination), so this is the only route by which they reach it.
+            if !(order.is_reduce_only() || closes_position)
                 && let Some(min_notional) = instrument.min_notional()
                 && notional.currency == min_notional.currency
                 && notional < min_notional
