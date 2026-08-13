@@ -79,6 +79,12 @@ fn format_rate_limit(rate_limit: &RateLimit) -> String {
 /// parameter closes an entire position and carries no quantity on the wire, so it
 /// is position-reducing in the same sense as a `reduce_only` order, but it cannot
 /// also be `reduce_only`, which venues reject in combination.
+///
+/// Because the wire carries no quantity for this order class, the order's own
+/// quantity is a local placeholder: every quantity and notional bound derived from
+/// it - `min_quantity`, `max_quantity`, `min_notional`, per-order and per-instrument
+/// `max_notional` - denies an order the venue itself would accept. Structural
+/// validation of the order is unaffected.
 fn closes_position(params: Option<&Params>) -> bool {
     params
         .and_then(|params| params.get_bool("close_position"))
@@ -639,15 +645,13 @@ impl RiskEngine {
             return; // Denied
         };
 
-        if !self.check_order(&instrument, &order) {
+        let closes_position = closes_position(command.params.as_ref());
+
+        if !self.check_order(&instrument, &order, closes_position) {
             return; // Denied
         }
 
-        if !self.check_orders_risk(
-            &instrument,
-            &[order],
-            closes_position(command.params.as_ref()),
-        ) {
+        if !self.check_orders_risk(&instrument, &[order], closes_position) {
             return; // Denied
         }
 
@@ -710,7 +714,7 @@ impl RiskEngine {
                 return; // Denied
             };
 
-            if !self.check_order(instrument, order) {
+            if !self.check_order(instrument, order, closes_position(command.params.as_ref())) {
                 return; // Denied
             }
         }
@@ -897,7 +901,12 @@ impl RiskEngine {
         }
 
         // Check Quantity
-        risk_msg = Self::check_quantity(&instrument, command.quantity, order.is_quote_quantity());
+        risk_msg = Self::check_quantity(
+            &instrument,
+            command.quantity,
+            order.is_quote_quantity(),
+            closes_position(command.params.as_ref()),
+        );
         if let Some(risk_msg) = risk_msg {
             self.reject_modify_order(&order, &risk_msg);
             return false;
@@ -931,9 +940,14 @@ impl RiskEngine {
         true
     }
 
-    fn check_order(&self, instrument: &InstrumentAny, order: &OrderAny) -> bool {
+    fn check_order(
+        &self,
+        instrument: &InstrumentAny,
+        order: &OrderAny,
+        closes_position: bool,
+    ) -> bool {
         if !self.check_order_price(instrument, order)
-            || !self.check_order_quantity(instrument, order)
+            || !self.check_order_quantity(instrument, order, closes_position)
         {
             return false; // Denied
         }
@@ -979,11 +993,17 @@ impl RiskEngine {
         true
     }
 
-    fn check_order_quantity(&self, instrument: &InstrumentAny, order: &OrderAny) -> bool {
+    fn check_order_quantity(
+        &self,
+        instrument: &InstrumentAny,
+        order: &OrderAny,
+        closes_position: bool,
+    ) -> bool {
         let risk_msg = Self::check_quantity(
             instrument,
             Some(order.quantity()),
             order.is_quote_quantity(),
+            closes_position,
         );
 
         if let Some(risk_msg) = risk_msg {
@@ -1404,7 +1424,14 @@ impl RiskEngine {
             // price and may differ from the venue fill, and some venues enforce
             // distinct per-order-type minimums. The venue is authoritative for
             // quote-denominated sizing; rely on `min_notional`/`max_notional` below.
-            if !order.is_quote_quantity() {
+            //
+            // They do not apply to a `close_position` order either, for a stronger
+            // reason: that order class carries no quantity on the wire at all, so the
+            // order's own quantity is a local placeholder the venue never sees, and
+            // bounding it denies a whole-position exit the venue itself accepts. The
+            // structural validation of the order - its type, side, trigger, and a
+            // positive placeholder quantity - is unaffected and still applies.
+            if !order.is_quote_quantity() && !closes_position {
                 if let Some(max_quantity) = instrument.max_quantity()
                     && effective_quantity > max_quantity
                 {
@@ -1450,8 +1477,11 @@ impl RiskEngine {
                 log::debug!("Notional: {notional:?}");
             }
 
-            // Check MAX notional per order limit
-            if let Some(max_notional_value) = max_notional
+            // Check MAX notional per order limit. Skipped for a `close_position`
+            // order on the same reasoning as the quantity bounds above: the notional
+            // is computed from a placeholder quantity that never reaches the wire.
+            if !closes_position
+                && let Some(max_notional_value) = max_notional
                 && notional > max_notional_value
             {
                 self.deny_order(
@@ -1470,7 +1500,8 @@ impl RiskEngine {
             // retire an entire position, which venues accept below the minimum for
             // the same reason. They cannot also be `reduce_only` (venues reject the
             // combination), so this is the only route by which they reach it.
-            if !(order.is_reduce_only() || closes_position)
+            if !order.is_reduce_only()
+                && !closes_position
                 && let Some(min_notional) = instrument.min_notional()
                 && notional.currency == min_notional.currency
                 && notional < min_notional
@@ -1486,8 +1517,10 @@ impl RiskEngine {
                 return false; // Denied
             }
 
-            // Check MAX notional instrument limit
-            if let Some(max_notional) = instrument.max_notional()
+            // Check MAX notional instrument limit. Skipped for a `close_position`
+            // order for the same reason as the bounds above.
+            if !closes_position
+                && let Some(max_notional) = instrument.max_notional()
                 && notional.currency == max_notional.currency
                 && notional > max_notional
             {
@@ -1973,6 +2006,7 @@ impl RiskEngine {
         instrument: &InstrumentAny,
         quantity: Option<Quantity>,
         is_quote_quantity: bool,
+        closes_position: bool,
     ) -> Option<String> {
         let quantity_val = quantity?;
 
@@ -1988,6 +2022,13 @@ impl RiskEngine {
 
         // Skip min/max checks for quote quantities (they will be checked in check_orders_risk using effective_quantity)
         if is_quote_quantity {
+            return None;
+        }
+
+        // Skip min/max checks for a `close_position` order: its quantity is a local
+        // placeholder that never reaches the wire, so bounding it denies a whole-
+        // position exit the venue accepts. Precision above still applies.
+        if closes_position {
             return None;
         }
 
