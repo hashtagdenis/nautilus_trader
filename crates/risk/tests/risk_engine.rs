@@ -3176,6 +3176,182 @@ fn test_submit_order_below_min_notional_respects_close_position(
     }
 }
 
+/// Returns an ETHUSDT perpetual with the given quantity and notional bounds.
+///
+/// The shared stub carries bounds a `close_position` placeholder quantity cannot
+/// realistically trip, so each bound below is exercised against an instrument that
+/// declares it.
+fn eth_usdt_with_bounds(
+    max_quantity: Option<Quantity>,
+    min_quantity: Option<Quantity>,
+    max_notional: Option<Money>,
+) -> InstrumentAny {
+    InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
+        InstrumentId::from("ETHUSDT-PERP.BINANCE"),
+        Symbol::from("ETHUSDT"),
+        Currency::from("ETH"),
+        Currency::from("USDT"),
+        Currency::from("USDT"),
+        false,
+        2,
+        3,
+        Price::from("0.01"),
+        Quantity::from("0.001"),
+        None,
+        None,
+        max_quantity,
+        min_quantity,
+        max_notional,
+        Some(Money::from("10.00 USDT")),
+        Some(Price::from("15000.00")),
+        Some(Price::from("1.0")),
+        Some(dec!(1.0)),
+        Some(dec!(0.35)),
+        Some(dec!(0.0002)),
+        Some(dec!(0.0004)),
+        None,
+        None,
+        UnixNanos::default(),
+        UnixNanos::default(),
+    ))
+}
+
+#[rstest]
+#[case::below_min_quantity(
+    None,
+    Some("1.000"),
+    None,
+    None,
+    "0.001",
+    "quantity 0.001 invalid (< minimum trade size of 1.000)"
+)]
+#[case::above_max_quantity(
+    Some("0.001"),
+    None,
+    None,
+    None,
+    "1.000",
+    "quantity 1.000 invalid (> maximum trade size of 0.001)"
+)]
+#[case::above_max_notional_per_order(
+    None,
+    None,
+    None,
+    Some(100),
+    "1.000",
+    "NOTIONAL_EXCEEDS_MAX_PER_ORDER"
+)]
+#[case::above_max_notional_for_instrument(
+    None,
+    None,
+    Some("100.00 USDT"),
+    None,
+    "1.000",
+    "NOTIONAL_EXCEEDS_MAXIMUM"
+)]
+fn test_submit_order_quantity_and_notional_bounds_respect_close_position(
+    #[case] max_quantity: Option<&str>,
+    #[case] min_quantity: Option<&str>,
+    #[case] max_notional: Option<&str>,
+    #[case] max_notional_per_order: Option<i64>,
+    #[case] quantity: &str,
+    #[case] expected_denial: &str,
+    #[values(false, true)] close_position: bool,
+    strategy_id_ema_cross: StrategyId,
+    client_id_binance: ClientId,
+    trader_id: TraderId,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    execute_order_event_handler: TypedIntoMessageSavingHandler<TradingCommand>,
+    mut simple_cache: Cache,
+) {
+    // A `close_position` order carries no quantity on the wire, so every bound
+    // derived from its placeholder quantity denies an order the venue accepts.
+    // Each case trips exactly one such bound, and the parameter is the only thing
+    // that changes between the denied and the forwarded run.
+    let instrument = eth_usdt_with_bounds(
+        max_quantity.map(Quantity::from),
+        min_quantity.map(Quantity::from),
+        max_notional.map(Money::from),
+    );
+    simple_cache.add_instrument(instrument.clone()).unwrap();
+
+    let mut margin_account =
+        margin_account_with_usdt_balance("100000 USDT", "0 USDT", "100000 USDT");
+    margin_account.set_default_leverage(dec!(10));
+    simple_cache
+        .add_account(AccountAny::Margin(margin_account))
+        .unwrap();
+
+    let mut risk_engine =
+        get_risk_engine(Some(Rc::new(RefCell::new(simple_cache))), None, None, false);
+    if let Some(limit) = max_notional_per_order {
+        risk_engine.set_max_notional_per_order(instrument.id(), Decimal::from_i64(limit).unwrap());
+    }
+
+    let order = OrderTestBuilder::new(OrderType::MarketIfTouched)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from(quantity))
+        .trigger_price(Price::from("5000.00"))
+        .build();
+    assert!(!order.is_reduce_only());
+
+    risk_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(client_id_binance), false)
+        .unwrap();
+
+    let mut params = Params::new();
+    params.insert("close_position".to_string(), Value::Bool(close_position));
+    let submit_order = SubmitOrder::new(
+        trader_id,
+        Some(client_id_binance),
+        strategy_id_ema_cross,
+        instrument.id(),
+        order.client_order_id(),
+        order.init_event().clone(),
+        None,
+        None,
+        Some(params),
+        UUID4::new(),
+        risk_engine.clock().borrow().timestamp_ns(),
+        None,
+    );
+
+    risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+
+    let saved_process_messages =
+        get_process_order_event_handler_messages(&process_order_event_handler);
+    let saved_execute_messages =
+        get_execute_order_event_handler_messages(&execute_order_event_handler);
+
+    if close_position {
+        assert!(saved_process_messages.is_empty());
+        assert_eq!(saved_execute_messages.len(), 1);
+        let TradingCommand::SubmitOrder(forwarded) = &saved_execute_messages[0] else {
+            panic!("Expected SubmitOrder command");
+        };
+        assert_eq!(forwarded.client_order_id, order.client_order_id());
+        assert!(!forwarded.order_init.reduce_only);
+    } else {
+        assert_eq!(saved_process_messages.len(), 1);
+        assert_eq!(
+            saved_process_messages[0].event_type(),
+            OrderEventType::Denied
+        );
+        assert!(
+            saved_process_messages[0]
+                .message()
+                .unwrap()
+                .starts_with(expected_denial),
+            "expected a {expected_denial} denial, got {:?}",
+            saved_process_messages[0].message()
+        );
+        assert!(saved_execute_messages.is_empty());
+    }
+}
+
 #[rstest]
 fn test_submit_order_when_greater_than_max_notional_for_instrument_then_denies(
     strategy_id_ema_cross: StrategyId,
